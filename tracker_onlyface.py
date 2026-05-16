@@ -3,7 +3,6 @@ import numpy as np
 import pandas as pd
 import argparse
 import os
-import math
 import warnings
 import onnxruntime as ort
 from insightface.app import FaceAnalysis
@@ -27,67 +26,6 @@ def format_time_ms(seconds):
 def log_note(out_dir, message):
     with open(os.path.join(out_dir, "notes.txt"), "a") as f:
         f.write(message + "\n")
-
-def detect_vision_pro_pointer_in_faces(frame, bboxes):
-    """
-    Highly optimized: Crops the raw frame FIRST, so grayscale conversion, 
-    blurring, and thresholding only happen on a few hundred pixels instead of millions.
-    """
-    if not bboxes:
-        return None
-        
-    for (x1, y1, x2, y2) in bboxes:
-        # Clamp coordinates to frame boundaries
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
-        
-        if x2 <= x1 or y2 <= y1:
-            continue
-            
-        roi = frame[y1:y2, x1:x2]
-        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        
-        blurred = cv2.GaussianBlur(gray_roi, (7, 7), 0)
-        thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 41, 3)
-        
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-        closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-        
-        contours, _ = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        
-        best_score = 0 
-        best_center = None
-        
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if 10 < area < 5000:
-                perimeter = cv2.arcLength(cnt, True)
-                if perimeter == 0: continue
-                    
-                hull_area = cv2.contourArea(cv2.convexHull(cnt))
-                if hull_area == 0: continue
-                
-                solidity = area / hull_area
-                rx, ry, rw, rh = cv2.boundingRect(cnt)
-                aspect_ratio = float(rw) / rh
-                
-                if solidity > 0.4 and 0.2 < aspect_ratio < 5.0:
-                    circularity = 4 * math.pi * (area / (perimeter * perimeter))
-                    score = solidity + (circularity * 0.5)
-                    
-                    if score > best_score:
-                        M = cv2.moments(cnt)
-                        if M["m00"] != 0:
-                            cx = int(M["m10"] / M["m00"])
-                            cy = int(M["m01"] / M["m00"])
-                            best_score = score
-                            # Translate local ROI coordinates back to global frame coordinates
-                            best_center = (x1 + cx, y1 + cy)
-                            
-        if best_center:
-            return best_center
-            
-    return None
 
 def process_single_video(video_task):
     filepath = video_task['filepath']
@@ -120,11 +58,10 @@ def process_single_video(video_task):
 
     writer = None
     if draw_video:
-        out_vid_path = os.path.join(out_dir, f"{base_name}_verification.mp4")
+        out_vid_path = os.path.join(out_dir, f"{base_name}_face_verification.mp4")
         writer = cv2.VideoWriter(out_vid_path, cv2.VideoWriter_fourcc(*'mp4v'), 2.0, (width, height))
 
     csv_data = []
-    prev_gaze = None
 
     print(f"[{base_name}] Started processing.")
 
@@ -143,40 +80,12 @@ def process_single_video(video_task):
 
         current_time_ms = format_time_ms(frame_idx / fps)
         
-        # 1. Detect faces first
         faces = app.get(frame)
-        bboxes = [list(map(int, face.bbox)) for face in faces]
-        
-        # 2. Search for pointer strictly within face bounding boxes
-        gaze_coords = detect_vision_pro_pointer_in_faces(frame, bboxes)
-        
-        gaze_x, gaze_y = None, None
-        delta_x, delta_y, euclidean_dist = None, None, None
-
-        if gaze_coords:
-            gaze_x, gaze_y = gaze_coords
-            if prev_gaze:
-                delta_x = gaze_x - prev_gaze[0]
-                delta_y = gaze_y - prev_gaze[1]
-                euclidean_dist = math.hypot(delta_x, delta_y)
-            prev_gaze = (gaze_x, gaze_y)
-            
-            if draw_video:
-                cv2.circle(frame, (gaze_x, gaze_y), 8, (255, 0, 0), -1)
-                cv2.drawMarker(frame, (gaze_x, gaze_y), (255, 255, 0), cv2.MARKER_CROSS, 25, 2)
-        else:
-            prev_gaze = None 
         
         row_data = {
             'frame': frame_idx,
             'time': current_time_ms,
-            'gaze_x': gaze_x,
-            'gaze_y': gaze_y,
-            'gaze_delta_x': delta_x,
-            'gaze_delta_y': delta_y,
-            'gaze_delta_euclidean': euclidean_dist,
-            'faces_detected_count': len(faces),
-            'gaze_on_any_face': False
+            'faces_detected_count': len(faces)
         }
 
         all_columns = target_ids + ['UNKNOWN']
@@ -184,8 +93,7 @@ def process_single_video(video_task):
             row_data.update({
                 f'{label_id}_detected': False,
                 f'{label_id}_tl_x': '', f'{label_id}_tl_y': '',
-                f'{label_id}_br_x': '', f'{label_id}_br_y': '',
-                f'gaze_on_{label_id}': False
+                f'{label_id}_br_x': '', f'{label_id}_br_y': ''
             })
 
         for face in faces:
@@ -203,21 +111,13 @@ def process_single_video(video_task):
                 identity = best_pid
 
             x1, y1, x2, y2 = map(int, face.bbox)
-            
-            gaze_hit = False
-            if gaze_coords:
-                gx, gy = gaze_coords
-                if x1 <= gx <= x2 and y1 <= gy <= y2:
-                    gaze_hit = True
-                    row_data['gaze_on_any_face'] = True
 
             row_data.update({
                 f'{identity}_detected': True,
                 f'{identity}_tl_x': x1,
                 f'{identity}_tl_y': y1,
                 f'{identity}_br_x': x2,
-                f'{identity}_br_y': y2,
-                f'gaze_on_{identity}': gaze_hit
+                f'{identity}_br_y': y2
             })
 
             if draw_video:
@@ -230,7 +130,6 @@ def process_single_video(video_task):
         if writer:
             writer.write(frame)
         
-        # Buffer skip via frame grabbing
         skip_frames = frame_interval - 1
         for _ in range(skip_frames):
             cap.grab()
@@ -242,53 +141,30 @@ def process_single_video(video_task):
     if writer: writer.release()
 
     df_out = pd.DataFrame(csv_data)
-    df_out.to_csv(os.path.join(out_dir, f"{base_name}_tracking.csv"), index=False)
+    df_out.to_csv(os.path.join(out_dir, f"{base_name}_face_tracking.csv"), index=False)
 
     total_queried = len(df_out)
-    total_gaze_detected = df_out['gaze_x'].notna().sum()
-
     if total_queried > 0:
         avg_faces = df_out['faces_detected_count'].mean()
         
         summary_data = {
             'total_frames_queried': total_queried,
-            'total_gaze_detected': total_gaze_detected,
-            'avg_faces_per_frame': round(avg_faces, 2),
-            'mean_gaze_delta_x': round(df_out['gaze_delta_x'].abs().mean(), 2),
-            'mean_gaze_delta_y': round(df_out['gaze_delta_y'].abs().mean(), 2),
-            'mean_gaze_euclidean': round(df_out['gaze_delta_euclidean'].mean(), 2)
+            'avg_faces_per_frame': round(avg_faces, 2)
         }
-
-        if total_gaze_detected > 0:
-            pct_gaze_any = (df_out['gaze_on_any_face'].sum() / total_gaze_detected) * 100
-            summary_data['pct_gaze_on_any_face'] = round(pct_gaze_any, 2)
-            
-            for pid in all_columns:
-                col_name = f'gaze_on_{pid}'
-                if col_name in df_out.columns:
-                    pct_gaze_specific = (df_out[col_name].sum() / total_gaze_detected) * 100
-                    summary_data[f'pct_{col_name}'] = round(pct_gaze_specific, 2)
-        else:
-            summary_data['pct_gaze_on_any_face'] = 0.0
-            for pid in all_columns:
-                col_name = f'gaze_on_{pid}'
-                if col_name in df_out.columns:
-                    summary_data[f'pct_{col_name}'] = 0.0
-
-        pd.DataFrame([summary_data]).to_csv(os.path.join(out_dir, f"{base_name}_summary.csv"), index=False)
+        pd.DataFrame([summary_data]).to_csv(os.path.join(out_dir, f"{base_name}_face_summary.csv"), index=False)
 
     print(f"[{base_name}] Completed and saved.")
     return base_name
 
 def get_args():
-    parser = argparse.ArgumentParser(description="Multiprocessing Face & Gaze Tracker")
+    parser = argparse.ArgumentParser(description="Multiprocessing Face Tracker (No Gaze)")
     parser.add_argument('manifest', nargs='?', type=str, default=r'C:\Users\VHILAB Core\Desktop\Spatial Coherence\facefinding\tracker_manifest.csv', help="Path to manifest.csv")
-    parser.add_argument('-t', action='store_true', help="Test mode: Only process a specific group for a specific duration")
-    parser.add_argument('-d', action='store_true', help="Output video with bounding boxes and gaze markers drawn onto frames")
+    parser.add_argument('-t', action='store_true', help="Test mode")
+    parser.add_argument('-d', action='store_true', help="Output drawn verification video")
     parser.add_argument('--dir', type=str, default=r'C:\Users\VHILAB Core\Desktop\Spatial Coherence\POV Videos')
     parser.add_argument('--out', type=str, default='./output')
     parser.add_argument('--known', type=str, default='./known_faces')
-    parser.add_argument('--workers', type=int, default=6, help="Number of concurrent videos to process")
+    parser.add_argument('--workers', type=int, default=6, help="Workers")
     return parser.parse_args()
 
 def main():
@@ -318,8 +194,6 @@ def main():
         except ValueError:
             print("Error: Invalid number. Exiting.")
             return
-
-        print(f"\n--- TEST MODE: Isolating Group {target_group} for {test_minutes} minute(s) per video ---")
     
     video_tasks = []
     grouped = df_manifest.groupby('group_num')
@@ -334,7 +208,7 @@ def main():
         for pid in target_ids:
             ref_dir = os.path.join(args.known, pid)
             if not os.path.exists(ref_dir):
-                log_note(args.out, f"Group {group_num}: Missing known_faces profile for participant {pid}.")
+                log_note(args.out, f"Group {group_num}: Missing profile for {pid}.")
                 continue
                 
             person_embeddings = []
@@ -346,8 +220,6 @@ def main():
             
             if person_embeddings:
                 master_embeddings[pid] = np.mean(person_embeddings, axis=0)
-            else:
-                log_note(args.out, f"Group {group_num}: No valid .npy files found in profile for {pid}.")
 
         for _, row in group_data.iterrows():
             pid = row['participant_num']
@@ -355,7 +227,6 @@ def main():
             filepath = os.path.join(args.dir, filename)
             
             if not os.path.exists(filepath):
-                log_note(args.out, f"Group {group_num}: Video missing. Skipping {filename}.")
                 continue
                 
             start_sec = time_to_sec(row['start_time'])
@@ -377,22 +248,19 @@ def main():
             })
 
     if not video_tasks:
-        print("No valid tasks found to process.")
+        print("No valid tasks found.")
         return
 
     print(f"Queue built: {len(video_tasks)} videos ready.")
-    print(f"Starting {args.workers} workers...\n")
-
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
         futures = [executor.submit(process_single_video, task) for task in video_tasks]
-        
         for future in as_completed(futures):
             try:
                 future.result()
             except Exception as exc:
-                print(f"Worker generated an exception: {exc}")
+                print(f"Exception: {exc}")
 
-    print("\nProcessing complete. Check notes.txt for warnings.")
+    print("\nProcessing complete.")
 
 if __name__ == "__main__":
     main()
