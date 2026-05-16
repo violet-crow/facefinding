@@ -29,37 +29,59 @@ def log_note(out_dir, message):
         f.write(message + "\n")
 
 def detect_vision_pro_pointer(frame):
+    """
+    Uses a Top-Hat morphological transform to identify regions that are 
+    locally brighter than their immediate surroundings, allowing for 
+    lenient shape distortion.
+    """
     scale = 0.5
     small_frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
-    
     gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.medianBlur(gray, 5)
     
-    circles = cv2.HoughCircles(
-        blurred, cv2.HOUGH_GRADIENT, dp=1.2, 
-        minDist=max(1, int(100 * scale)),
-        param1=100, param2=30, 
-        minRadius=max(1, int(10 * scale)), 
-        maxRadius=max(2, int(40 * scale))
-    )
+    # Kernel size represents the maximum expected diameter of the pointer
+    # At 50% scale, a 45x45 kernel captures anything up to 90px in the original
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (45, 45))
     
-    if circles is not None:
-        circles = np.round(circles[0, :]).astype("int")
-        best_circle = None
-        max_brightness = -1
-        
-        for (x, y, r) in circles:
-            if 0 <= x < gray.shape[1] and 0 <= y < gray.shape[0]:
-                brightness = int(gray[y, x])
-                if brightness > max_brightness:
-                    max_brightness = brightness
-                    best_circle = (x, y)
-                    
-        if best_circle:
-            native_x = int(best_circle[0] / scale)
-            native_y = int(best_circle[1] / scale)
-            return native_x, native_y
+    # The Top-Hat transform isolates pixels brighter than their local neighborhood
+    tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
+    
+    # Threshold the result to isolate the brightest anomalies
+    _, thresh = cv2.threshold(tophat, 30, 255, cv2.THRESH_BINARY)
+    
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    best_center = None
+    max_brightness = -1
+    
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        # Lenient area constraints (roughly equivalent to r=4 to r=25 in downscaled frame)
+        if 50 < area < 2000:
+            x, y, w, h = cv2.boundingRect(cnt)
+            aspect_ratio = float(w) / h
             
+            # Highly lenient aspect ratio (0.4 to 2.5) to allow for stretching/morphing
+            if 0.4 < aspect_ratio < 2.5:
+                # Calculate the centroid of the blob
+                M = cv2.moments(cnt)
+                if M["m00"] != 0:
+                    cx = int(M["m10"] / M["m00"])
+                    cy = int(M["m01"] / M["m00"])
+                    
+                    # Evaluate the actual grayscale brightness inside this contour
+                    mask = np.zeros_like(gray)
+                    cv2.drawContours(mask, [cnt], -1, 255, -1)
+                    mean_val = cv2.mean(gray, mask=mask)[0]
+                    
+                    if mean_val > max_brightness:
+                        max_brightness = mean_val
+                        best_center = (cx, cy)
+                        
+    if best_center:
+        native_x = int(best_center[0] / scale)
+        native_y = int(best_center[1] / scale)
+        return native_x, native_y
+        
     return None
 
 def process_single_video(video_task):
@@ -81,7 +103,7 @@ def process_single_video(video_task):
     width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
-    frame_interval = max(1, int(fps / 2)) # Process exactly 2 frames per second
+    frame_interval = max(1, int(fps / 2))
     start_frame = int(start_sec * fps)
     end_frame = min(int(end_sec * fps), total_video_frames)
     
@@ -94,7 +116,6 @@ def process_single_video(video_task):
     writer = None
     if draw_video:
         out_vid_path = os.path.join(out_dir, f"{base_name}_verification.mp4")
-        # Set video to 2.0 FPS so timelapse plays back at human real-time speed
         writer = cv2.VideoWriter(out_vid_path, cv2.VideoWriter_fourcc(*'mp4v'), 2.0, (width, height))
 
     csv_data = []
@@ -129,10 +150,9 @@ def process_single_video(video_task):
                 euclidean_dist = math.hypot(delta_x, delta_y)
             prev_gaze = (gaze_x, gaze_y)
             
-            # If drawing mode is on, draw gaze indicator
             if draw_video:
-                cv2.circle(frame, (gaze_x, gaze_y), 8, (255, 0, 0), -1) # Blue filled dot
-                cv2.drawMarker(frame, (gaze_x, gaze_y), (255, 255, 0), cv2.MARKER_CROSS, 25, 2) # Cyan crosshair
+                cv2.circle(frame, (gaze_x, gaze_y), 8, (255, 0, 0), -1)
+                cv2.drawMarker(frame, (gaze_x, gaze_y), (255, 255, 0), cv2.MARKER_CROSS, 25, 2)
         else:
             prev_gaze = None 
 
@@ -191,11 +211,9 @@ def process_single_video(video_task):
                 f'gaze_on_{identity}': gaze_hit
             })
 
-            # Drawing face bounding boxes and metadata labels
             if draw_video:
-                color = (0, 255, 0) if identity != "UNKNOWN" else (128, 128, 128) # Green for known, Gray for Unknown
+                color = (0, 255, 0) if identity != "UNKNOWN" else (128, 128, 128)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                
                 label_str = f"{identity} ({highest_sim:.2f})" if identity != "UNKNOWN" else "UNKNOWN"
                 cv2.putText(frame, label_str, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
@@ -217,24 +235,37 @@ def process_single_video(video_task):
     df_out.to_csv(os.path.join(out_dir, f"{base_name}_tracking.csv"), index=False)
 
     total_queried = len(df_out)
+    # Count strictly frames where gaze was physically detected
+    total_gaze_detected = df_out['gaze_x'].notna().sum()
+
     if total_queried > 0:
         avg_faces = df_out['faces_detected_count'].mean()
-        pct_gaze_any = (df_out['gaze_on_any_face'].sum() / total_queried) * 100
         
         summary_data = {
             'total_frames_queried': total_queried,
+            'total_gaze_detected': total_gaze_detected,
             'avg_faces_per_frame': round(avg_faces, 2),
-            'pct_gaze_on_any_face': round(pct_gaze_any, 2),
             'mean_gaze_delta_x': round(df_out['gaze_delta_x'].abs().mean(), 2),
             'mean_gaze_delta_y': round(df_out['gaze_delta_y'].abs().mean(), 2),
             'mean_gaze_euclidean': round(df_out['gaze_delta_euclidean'].mean(), 2)
         }
 
-        for pid in all_columns:
-            col_name = f'gaze_on_{pid}'
-            if col_name in df_out.columns:
-                pct_gaze_specific = (df_out[col_name].sum() / total_queried) * 100
-                summary_data[f'pct_{col_name}'] = round(pct_gaze_specific, 2)
+        # Calculate percentages based entirely on frames where the gaze circle existed
+        if total_gaze_detected > 0:
+            pct_gaze_any = (df_out['gaze_on_any_face'].sum() / total_gaze_detected) * 100
+            summary_data['pct_gaze_on_any_face'] = round(pct_gaze_any, 2)
+            
+            for pid in all_columns:
+                col_name = f'gaze_on_{pid}'
+                if col_name in df_out.columns:
+                    pct_gaze_specific = (df_out[col_name].sum() / total_gaze_detected) * 100
+                    summary_data[f'pct_{col_name}'] = round(pct_gaze_specific, 2)
+        else:
+            summary_data['pct_gaze_on_any_face'] = 0.0
+            for pid in all_columns:
+                col_name = f'gaze_on_{pid}'
+                if col_name in df_out.columns:
+                    summary_data[f'pct_{col_name}'] = 0.0
 
         pd.DataFrame([summary_data]).to_csv(os.path.join(out_dir, f"{base_name}_summary.csv"), index=False)
 
