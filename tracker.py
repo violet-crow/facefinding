@@ -30,59 +30,59 @@ def log_note(out_dir, message):
 
 def detect_vision_pro_pointer(frame):
     """
-    Uses a Top-Hat morphological transform to identify regions that are 
-    locally brighter than their immediate surroundings, allowing for 
-    lenient shape distortion.
+    Detects the pointer using Adaptive Thresholding and Morphological Closing 
+    to handle severe blurring, internal color gradients, and perspective distortion.
     """
-    scale = 0.5
-    small_frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
-    gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     
-    # Kernel size represents the maximum expected diameter of the pointer
-    # At 50% scale, a 45x45 kernel captures anything up to 90px in the original
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (45, 45))
+    # 1. Blur to merge internal color gradients and noise
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
     
-    # The Top-Hat transform isolates pixels brighter than their local neighborhood
-    tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
+    # 2. Adaptive thresholding with a larger block size (41) to capture the whole blob
+    thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 41, 3)
     
-    # Threshold the result to isolate the brightest anomalies
-    _, thresh = cv2.threshold(tophat, 30, 255, cv2.THRESH_BINARY)
+    # 3. Morphological Closing to fill in holes and stitch fractured edges together
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
     
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Find contours on the newly closed, solid shapes
+    contours, _ = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     
     best_center = None
-    max_brightness = -1
-    
+    best_score = 0 
+
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        # Lenient area constraints (roughly equivalent to r=4 to r=25 in downscaled frame)
-        if 50 < area < 2000:
+        
+        if 20 < area < 3000:
+            perimeter = cv2.arcLength(cnt, True)
+            if perimeter == 0:
+                continue
+                
+            hull = cv2.convexHull(cnt)
+            hull_area = cv2.contourArea(hull)
+            if hull_area == 0: 
+                continue
+            solidity = area / hull_area
+            
+            circularity = 4 * math.pi * (area / (perimeter * perimeter))
+            
             x, y, w, h = cv2.boundingRect(cnt)
             aspect_ratio = float(w) / h
             
-            # Highly lenient aspect ratio (0.4 to 2.5) to allow for stretching/morphing
-            if 0.4 < aspect_ratio < 2.5:
-                # Calculate the centroid of the blob
-                M = cv2.moments(cnt)
-                if M["m00"] != 0:
-                    cx = int(M["m10"] / M["m00"])
-                    cy = int(M["m01"] / M["m00"])
-                    
-                    # Evaluate the actual grayscale brightness inside this contour
-                    mask = np.zeros_like(gray)
-                    cv2.drawContours(mask, [cnt], -1, 255, -1)
-                    mean_val = cv2.mean(gray, mask=mask)[0]
-                    
-                    if mean_val > max_brightness:
-                        max_brightness = mean_val
-                        best_center = (cx, cy)
+            if solidity > 0.85 and 0.3 < aspect_ratio < 3.0:
+                score = solidity + (circularity * 0.5)
+                
+                if score > best_score:
+                    M = cv2.moments(cnt)
+                    if M["m00"] != 0:
+                        cx = int(M["m10"] / M["m00"])
+                        cy = int(M["m01"] / M["m00"])
                         
-    if best_center:
-        native_x = int(best_center[0] / scale)
-        native_y = int(best_center[1] / scale)
-        return native_x, native_y
-        
-    return None
+                        best_score = score
+                        best_center = (cx, cy)
+
+    return best_center
 
 def process_single_video(video_task):
     filepath = video_task['filepath']
