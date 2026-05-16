@@ -29,10 +29,6 @@ def log_note(out_dir, message):
         f.write(message + "\n")
 
 def detect_vision_pro_pointer(frame):
-    """
-    Downscales frame by 50% to drop CPU pixel overhead by 4x,
-    accelerating Hough Circle calculations.
-    """
     scale = 0.5
     small_frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
     
@@ -74,6 +70,7 @@ def process_single_video(video_task):
     master_embeddings = video_task['master_embeddings']
     target_ids = video_task['target_ids']
     out_dir = video_task['out_dir']
+    draw_video = video_task['draw_video']
 
     app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider'])
     app.prepare(ctx_id=0, det_size=(640, 640))
@@ -81,8 +78,10 @@ def process_single_video(video_task):
     cap = cv2.VideoCapture(filepath)
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
-    frame_interval = max(1, int(fps / 2)) # Strictly 2 frames per second
+    frame_interval = max(1, int(fps / 2)) # Process exactly 2 frames per second
     start_frame = int(start_sec * fps)
     end_frame = min(int(end_sec * fps), total_video_frames)
     
@@ -91,6 +90,12 @@ def process_single_video(video_task):
     total_frames_to_process = max(1, end_frame - start_frame)
     
     print_interval = max(1, int(total_frames_to_process / 10))
+
+    writer = None
+    if draw_video:
+        out_vid_path = os.path.join(out_dir, f"{base_name}_verification.mp4")
+        # Set video to 2.0 FPS so timelapse plays back at human real-time speed
+        writer = cv2.VideoWriter(out_vid_path, cv2.VideoWriter_fourcc(*'mp4v'), 2.0, (width, height))
 
     csv_data = []
     prev_gaze = None
@@ -123,6 +128,11 @@ def process_single_video(video_task):
                 delta_y = gaze_y - prev_gaze[1]
                 euclidean_dist = math.hypot(delta_x, delta_y)
             prev_gaze = (gaze_x, gaze_y)
+            
+            # If drawing mode is on, draw gaze indicator
+            if draw_video:
+                cv2.circle(frame, (gaze_x, gaze_y), 8, (255, 0, 0), -1) # Blue filled dot
+                cv2.drawMarker(frame, (gaze_x, gaze_y), (255, 255, 0), cv2.MARKER_CROSS, 25, 2) # Cyan crosshair
         else:
             prev_gaze = None 
 
@@ -140,7 +150,6 @@ def process_single_video(video_task):
             'gaze_on_any_face': False
         }
 
-        # Setup standard column headers for Group Members + Unified UNKNOWN
         all_columns = target_ids + ['UNKNOWN']
         for label_id in all_columns:
             row_data.update({
@@ -155,14 +164,12 @@ def process_single_video(video_task):
             highest_sim = -1
             best_pid = None
             
-            # Identify closest match among group members
             for pid, master_emb in master_embeddings.items():
                 sim = np.dot(face.normed_embedding, master_emb)
                 if sim > highest_sim:
                     highest_sim = sim
                     best_pid = pid
 
-            # Aggressive assignment threshold
             if highest_sim > 0.38:
                 identity = best_pid
 
@@ -184,9 +191,18 @@ def process_single_video(video_task):
                 f'gaze_on_{identity}': gaze_hit
             })
 
+            # Drawing face bounding boxes and metadata labels
+            if draw_video:
+                color = (0, 255, 0) if identity != "UNKNOWN" else (128, 128, 128) # Green for known, Gray for Unknown
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                
+                label_str = f"{identity} ({highest_sim:.2f})" if identity != "UNKNOWN" else "UNKNOWN"
+                cv2.putText(frame, label_str, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
         csv_data.append(row_data)
+        if writer:
+            writer.write(frame)
         
-        # Fast-forward frame skip buffer
         skip_frames = frame_interval - 1
         for _ in range(skip_frames):
             cap.grab()
@@ -195,6 +211,7 @@ def process_single_video(video_task):
         frame_idx += 1
 
     cap.release()
+    if writer: writer.release()
 
     df_out = pd.DataFrame(csv_data)
     df_out.to_csv(os.path.join(out_dir, f"{base_name}_tracking.csv"), index=False)
@@ -228,6 +245,7 @@ def get_args():
     parser = argparse.ArgumentParser(description="Multiprocessing Face & Gaze Tracker")
     parser.add_argument('manifest', nargs='?', type=str, default=r'C:\Users\VHILAB Core\Desktop\Spatial Coherence\facefinding\tracker_manifest.csv', help="Path to manifest.csv")
     parser.add_argument('-t', action='store_true', help="Test mode: Only process a specific group for a specific duration")
+    parser.add_argument('-d', action='store_true', help="Output video with bounding boxes and gaze markers drawn onto frames")
     parser.add_argument('--dir', type=str, default=r'C:\Users\VHILAB Core\Desktop\Spatial Coherence\POV Videos')
     parser.add_argument('--out', type=str, default='./output')
     parser.add_argument('--known', type=str, default='./known_faces')
@@ -315,7 +333,8 @@ def main():
                 'end_sec': end_sec,
                 'master_embeddings': master_embeddings,
                 'target_ids': target_ids,
-                'out_dir': group_out_dir
+                'out_dir': group_out_dir,
+                'draw_video': args.d
             })
 
     if not video_tasks:
