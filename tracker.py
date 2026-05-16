@@ -4,10 +4,12 @@ import pandas as pd
 import argparse
 import os
 import math
+import warnings
 import onnxruntime as ort
 from insightface.app import FaceAnalysis
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from tqdm import tqdm
+
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 def time_to_sec(time_str):
     if pd.isna(time_str) or not str(time_str).strip(): return 0
@@ -23,17 +25,26 @@ def format_time_ms(seconds):
     return f"{m:02d}:{s:06.3f}"
 
 def log_note(out_dir, message):
-    """Thread-safe-ish logging for the main process."""
     with open(os.path.join(out_dir, "notes.txt"), "a") as f:
         f.write(message + "\n")
 
 def detect_vision_pro_pointer(frame):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    """
+    Downscales frame by 50% to drop CPU pixel overhead by 4x,
+    accelerating Hough Circle calculations.
+    """
+    scale = 0.5
+    small_frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+    
+    gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
     blurred = cv2.medianBlur(gray, 5)
     
     circles = cv2.HoughCircles(
-        blurred, cv2.HOUGH_GRADIENT, dp=1.2, minDist=100,
-        param1=100, param2=30, minRadius=10, maxRadius=40
+        blurred, cv2.HOUGH_GRADIENT, dp=1.2, 
+        minDist=max(1, int(100 * scale)),
+        param1=100, param2=30, 
+        minRadius=max(1, int(10 * scale)), 
+        maxRadius=max(2, int(40 * scale))
     )
     
     if circles is not None:
@@ -42,20 +53,20 @@ def detect_vision_pro_pointer(frame):
         max_brightness = -1
         
         for (x, y, r) in circles:
-            if 0 <= x < frame.shape[1] and 0 <= y < frame.shape[0]:
+            if 0 <= x < gray.shape[1] and 0 <= y < gray.shape[0]:
                 brightness = int(gray[y, x])
                 if brightness > max_brightness:
                     max_brightness = brightness
                     best_circle = (x, y)
                     
-        return best_circle
+        if best_circle:
+            native_x = int(best_circle[0] / scale)
+            native_y = int(best_circle[1] / scale)
+            return native_x, native_y
+            
     return None
 
 def process_single_video(video_task):
-    """
-    This function runs in an isolated process. 
-    It MUST initialize its own FaceAnalysis instance to be thread-safe with CUDA.
-    """
     filepath = video_task['filepath']
     base_name = video_task['base_name']
     start_sec = video_task['start_sec']
@@ -64,7 +75,6 @@ def process_single_video(video_task):
     target_ids = video_task['target_ids']
     out_dir = video_task['out_dir']
 
-    # Isolate CUDA provider to this process
     app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider'])
     app.prepare(ctx_id=0, det_size=(640, 640))
 
@@ -72,32 +82,36 @@ def process_single_video(video_task):
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
-    frame_interval = max(1, int(fps / 2)) # 2 FPS
+    frame_interval = max(1, int(fps / 2)) # Strictly 2 frames per second
     start_frame = int(start_sec * fps)
     end_frame = min(int(end_sec * fps), total_video_frames)
     
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     frame_idx = start_frame
+    total_frames_to_process = max(1, end_frame - start_frame)
+    
+    print_interval = max(1, int(total_frames_to_process / 10))
 
     csv_data = []
     prev_gaze = None
-    
-    # Dynamic Unknown Tracker
-    unknown_faces_bank = [] # [{'id': 'UNKNOWN_1', 'emb': np.array}, ...]
-    unknown_counter = 1
+
+    print(f"[{base_name}] Started processing.")
 
     while cap.isOpened() and frame_idx <= end_frame:
         ret, frame = cap.read()
         if not ret: break
 
-        # Extreme Efficiency: Only decode the frame if it's the interval frame
         if (frame_idx - start_frame) % frame_interval != 0:
             frame_idx += 1
             continue
 
+        frames_processed = frame_idx - start_frame
+        if frames_processed % print_interval == 0 or frame_idx == end_frame:
+            percent = (frames_processed / total_frames_to_process) * 100
+            print(f"[{base_name}] Frame {frame_idx}/{end_frame} ({percent:.1f}%)")
+
         current_time_ms = format_time_ms(frame_idx / fps)
         
-        # 1. Gaze
         gaze_coords = detect_vision_pro_pointer(frame)
         gaze_x, gaze_y = None, None
         delta_x, delta_y, euclidean_dist = None, None, None
@@ -112,7 +126,6 @@ def process_single_video(video_task):
         else:
             prev_gaze = None 
 
-        # 2. Faces
         faces = app.get(frame)
         
         row_data = {
@@ -127,45 +140,31 @@ def process_single_video(video_task):
             'gaze_on_any_face': False
         }
 
-        # Initialize known participant columns
-        for pid in target_ids:
+        # Setup standard column headers for Group Members + Unified UNKNOWN
+        all_columns = target_ids + ['UNKNOWN']
+        for label_id in all_columns:
             row_data.update({
-                f'{pid}_detected': False,
-                f'{pid}_tl_x': '', f'{pid}_tl_y': '',
-                f'{pid}_br_x': '', f'{pid}_br_y': '',
-                f'gaze_on_{pid}': False
+                f'{label_id}_detected': False,
+                f'{label_id}_tl_x': '', f'{label_id}_tl_y': '',
+                f'{label_id}_br_x': '', f'{label_id}_br_y': '',
+                f'gaze_on_{label_id}': False
             })
 
         for face in faces:
-            identity = None
+            identity = "UNKNOWN"
             highest_sim = -1
+            best_pid = None
             
-            # Check Known Profiles
+            # Identify closest match among group members
             for pid, master_emb in master_embeddings.items():
                 sim = np.dot(face.normed_embedding, master_emb)
-                if sim > 0.5 and sim > highest_sim:
+                if sim > highest_sim:
                     highest_sim = sim
-                    identity = pid
+                    best_pid = pid
 
-            # Check Unknown Bank if no known profile matched
-            if not identity:
-                highest_unk_sim = -1
-                for unk in unknown_faces_bank:
-                    sim = np.dot(face.normed_embedding, unk['emb'])
-                    if sim > 0.5 and sim > highest_unk_sim:
-                        highest_unk_sim = sim
-                        identity = unk['id']
-                
-                # If still no identity, register a new UNKNOWN
-                if not identity:
-                    identity = f"UNKNOWN_{unknown_counter}"
-                    unknown_faces_bank.append({'id': identity, 'emb': face.normed_embedding})
-                    unknown_counter += 1
-
-            # Ensure columns exist dynamically for unknowns
-            for prefix in [f'{identity}_detected', f'{identity}_tl_x', f'{identity}_tl_y', f'{identity}_br_x', f'{identity}_br_y', f'gaze_on_{identity}']:
-                if prefix not in row_data:
-                    row_data[prefix] = False if 'detected' in prefix or 'gaze' in prefix else ''
+            # Aggressive assignment threshold
+            if highest_sim > 0.38:
+                identity = best_pid
 
             x1, y1, x2, y2 = map(int, face.bbox)
             
@@ -187,7 +186,7 @@ def process_single_video(video_task):
 
         csv_data.append(row_data)
         
-        # Fast-forward using grab() to avoid decoding frames we don't need
+        # Fast-forward frame skip buffer
         skip_frames = frame_interval - 1
         for _ in range(skip_frames):
             cap.grab()
@@ -214,9 +213,7 @@ def process_single_video(video_task):
             'mean_gaze_euclidean': round(df_out['gaze_delta_euclidean'].mean(), 2)
         }
 
-        # Dynamically aggregate all known and unknown IDs tracked in this file
-        tracked_ids = [col.replace('_detected', '') for col in df_out.columns if col.endswith('_detected')]
-        for pid in tracked_ids:
+        for pid in all_columns:
             col_name = f'gaze_on_{pid}'
             if col_name in df_out.columns:
                 pct_gaze_specific = (df_out[col_name].sum() / total_queried) * 100
@@ -224,17 +221,16 @@ def process_single_video(video_task):
 
         pd.DataFrame([summary_data]).to_csv(os.path.join(out_dir, f"{base_name}_summary.csv"), index=False)
 
+    print(f"[{base_name}] Completed and saved.")
     return base_name
 
 def get_args():
     parser = argparse.ArgumentParser(description="Multiprocessing Face & Gaze Tracker")
-    # Added nargs='?' so the default is used if no argument is provided
     parser.add_argument('manifest', nargs='?', type=str, default=r'C:\Users\VHILAB Core\Desktop\Spatial Coherence\facefinding\tracker_manifest.csv', help="Path to manifest.csv")
-    parser.add_argument('-t', action='store_true', help="Test mode: Only process a specific group")
+    parser.add_argument('-t', action='store_true', help="Test mode: Only process a specific group for a specific duration")
     parser.add_argument('--dir', type=str, default=r'C:\Users\VHILAB Core\Desktop\Spatial Coherence\POV Videos')
     parser.add_argument('--out', type=str, default='./output')
     parser.add_argument('--known', type=str, default='./known_faces')
-    # Use 6 workers to balance massive VRAM with CPU/Disk bottlenecks
     parser.add_argument('--workers', type=int, default=6, help="Number of concurrent videos to process")
     return parser.parse_args()
 
@@ -242,31 +238,33 @@ def main():
     args = get_args()
     os.makedirs(args.out, exist_ok=True)
     
-    # Initialize notes.txt
     with open(os.path.join(args.out, "notes.txt"), "w") as f:
         f.write("--- Processing Log ---\n")
 
     if not os.path.exists(args.manifest):
-        print(f"!!! Error: Could not find manifest file at {args.manifest}")
+        print(f"Error: Could not find manifest file at {args.manifest}")
         return
 
-    # Read manifest, ensuring participant_num and group_num are read strictly as strings
     df_manifest = pd.read_csv(args.manifest, dtype={'participant_num': str, 'group_num': str})
-    
-    # Test Mode Filter
+    test_minutes = None
+
     if args.t:
         target_group = input("Enter the group_num to test: ").strip()
         df_manifest = df_manifest[df_manifest['group_num'] == target_group]
         
         if df_manifest.empty:
-            print(f"!!! Error: Group '{target_group}' not found in manifest.")
+            print(f"Error: Group '{target_group}' not found in manifest.")
             return
-        print(f"\n--- TEST MODE: Isolating Group {target_group} ---")
-    
-    # Build list of tasks for the process pool
-    video_tasks = []
+            
+        try:
+            test_minutes = float(input("Enter minutes to process per video (e.g., 1 or 0.5): "))
+        except ValueError:
+            print("Error: Invalid number. Exiting.")
+            return
 
-    # Group by the relational group_num
+        print(f"\n--- TEST MODE: Isolating Group {target_group} for {test_minutes} minute(s) per video ---")
+    
+    video_tasks = []
     grouped = df_manifest.groupby('group_num')
     
     for group_num, group_data in grouped:
@@ -275,7 +273,6 @@ def main():
         
         target_ids = group_data['participant_num'].tolist()
         
-        # Load Reference Profiles for this entire group
         master_embeddings = {}
         for pid in target_ids:
             ref_dir = os.path.join(args.known, pid)
@@ -295,7 +292,6 @@ def main():
             else:
                 log_note(args.out, f"Group {group_num}: No valid .npy files found in profile for {pid}.")
 
-        # Generate individual tasks for each video in the group
         for _, row in group_data.iterrows():
             pid = row['participant_num']
             filename = f"{pid}_POV.mp4"
@@ -307,7 +303,10 @@ def main():
                 
             start_sec = time_to_sec(row['start_time'])
             end_sec = time_to_sec(row['end_time'])
-            if end_sec == 0: end_sec = float('inf') # Fallback if end_time is empty
+            if end_sec == 0: end_sec = float('inf')
+
+            if args.t and test_minutes is not None:
+                end_sec = min(end_sec, start_sec + (test_minutes * 60))
 
             video_tasks.append({
                 'filepath': filepath,
@@ -323,26 +322,19 @@ def main():
         print("No valid tasks found to process.")
         return
 
-    print(f"\nQueue built: {len(video_tasks)} videos ready for processing.")
-    print(f"Firing up {args.workers} RTX 4090 workers. Hold on to your hats...\n")
+    print(f"Queue built: {len(video_tasks)} videos ready.")
+    print(f"Starting {args.workers} workers...\n")
 
-    # Multiprocessing Execution with Progress Bar
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(process_single_video, task): task for task in video_tasks}
+        futures = [executor.submit(process_single_video, task) for task in video_tasks]
         
-        for future in tqdm(as_completed(futures), total=len(video_tasks), desc="Processing Videos", unit="vid"):
+        for future in as_completed(futures):
             try:
-                base_name = future.result()
+                future.result()
             except Exception as exc:
-                task = futures[future]
-                err_msg = f"Video {task['base_name']} generated an exception: {exc}"
-                print(f"\n{err_msg}")
-                log_note(args.out, err_msg)
+                print(f"Worker generated an exception: {exc}")
 
-    print("\n=========================================")
-    print("       ALL BATCH PROCESSING COMPLETE       ")
-    print("       Check notes.txt for warnings.       ")
-    print("=========================================")
+    print("\nProcessing complete. Check notes.txt for warnings.")
 
 if __name__ == "__main__":
     main()
