@@ -228,8 +228,10 @@ def process_single_video(video_task):
 
 def get_args():
     parser = argparse.ArgumentParser(description="Multiprocessing Face & Gaze Tracker")
-    parser.add_argument('manifest', type=str, help="Path to manifest.csv")
-    parser.add_argument('--dir', type=str, default=r'C:\Users\cr0w\Desktop\Persona\POV Videos')
+    # Added nargs='?' so the default is used if no argument is provided
+    parser.add_argument('manifest', nargs='?', type=str, default=r'C:\Users\VHILAB Core\Desktop\Spatial Coherence\facefinding\tracker_manifest.csv', help="Path to manifest.csv")
+    parser.add_argument('-t', action='store_true', help="Test mode: Only process a specific group")
+    parser.add_argument('--dir', type=str, default=r'C:\Users\VHILAB Core\Desktop\Spatial Coherence\POV Videos')
     parser.add_argument('--out', type=str, default='./output')
     parser.add_argument('--known', type=str, default='./known_faces')
     # Use 6 workers to balance massive VRAM with CPU/Disk bottlenecks
@@ -244,8 +246,22 @@ def main():
     with open(os.path.join(args.out, "notes.txt"), "w") as f:
         f.write("--- Processing Log ---\n")
 
-    # Read manifest, ensuring participant_num is read strictly as a string
-    df_manifest = pd.read_csv(args.manifest, dtype={'participant_num': str})
+    if not os.path.exists(args.manifest):
+        print(f"!!! Error: Could not find manifest file at {args.manifest}")
+        return
+
+    # Read manifest, ensuring participant_num and group_num are read strictly as strings
+    df_manifest = pd.read_csv(args.manifest, dtype={'participant_num': str, 'group_num': str})
+    
+    # Test Mode Filter
+    if args.t:
+        target_group = input("Enter the group_num to test: ").strip()
+        df_manifest = df_manifest[df_manifest['group_num'] == target_group]
+        
+        if df_manifest.empty:
+            print(f"!!! Error: Group '{target_group}' not found in manifest.")
+            return
+        print(f"\n--- TEST MODE: Isolating Group {target_group} ---")
     
     # Build list of tasks for the process pool
     video_tasks = []
