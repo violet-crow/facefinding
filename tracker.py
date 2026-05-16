@@ -30,14 +30,13 @@ def log_note(out_dir, message):
 
 def detect_vision_pro_pointer_in_faces(frame, bboxes):
     """
-    Highly optimized: Crops the raw frame FIRST, so grayscale conversion, 
-    blurring, and thresholding only happen on a few hundred pixels instead of millions.
+    Searches for the pointer ONLY within face boxes, using strict geometric 
+    confidence scoring to reject facial highlights and false positives.
     """
     if not bboxes:
         return None
         
     for (x1, y1, x2, y2) in bboxes:
-        # Clamp coordinates to frame boundaries
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
         
@@ -47,10 +46,13 @@ def detect_vision_pro_pointer_in_faces(frame, bboxes):
         roi = frame[y1:y2, x1:x2]
         gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         
-        blurred = cv2.GaussianBlur(gray_roi, (7, 7), 0)
-        thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 41, 3)
+        face_area = (x2 - x1) * (y2 - y1)
         
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        # Adaptive threshold with a tighter block size to isolate small UI elements
+        blurred = cv2.GaussianBlur(gray_roi, (5, 5), 0)
+        thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 4)
+        
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
         
         contours, _ = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
@@ -60,7 +62,11 @@ def detect_vision_pro_pointer_in_faces(frame, bboxes):
         
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if 10 < area < 5000:
+            
+            # Constraint 1: The pointer should be between 20 pixels and 10% of the face area.
+            max_pointer_area = min(3000, face_area * 0.10)
+            
+            if 20 < area < max_pointer_area:
                 perimeter = cv2.arcLength(cnt, True)
                 if perimeter == 0: continue
                     
@@ -71,22 +77,30 @@ def detect_vision_pro_pointer_in_faces(frame, bboxes):
                 rx, ry, rw, rh = cv2.boundingRect(cnt)
                 aspect_ratio = float(rw) / rh
                 
-                if solidity > 0.4 and 0.2 < aspect_ratio < 5.0:
+                # Constraint 2: Must be highly convex (solid) and not a long streak
+                if solidity > 0.80 and 0.5 < aspect_ratio < 2.0:
                     circularity = 4 * math.pi * (area / (perimeter * perimeter))
-                    score = solidity + (circularity * 0.5)
                     
-                    if score > best_score:
-                        M = cv2.moments(cnt)
-                        if M["m00"] != 0:
-                            cx = int(M["m10"] / M["m00"])
-                            cy = int(M["m01"] / M["m00"])
-                            best_score = score
-                            # Translate local ROI coordinates back to global frame coordinates
-                            best_center = (x1 + cx, y1 + cy)
+                    # Constraint 3: Must be at least vaguely circular
+                    if circularity > 0.55:
+                        
+                        # Weight solidity higher than circularity to survive perspective warping
+                        score = (solidity * 0.6) + (circularity * 0.4)
+                        
+                        # Constraint 4: The Confidence Floor. Reject low-scoring blobs entirely.
+                        if score > best_score and score > 0.75:
+                            M = cv2.moments(cnt)
+                            if M["m00"] != 0:
+                                cx = int(M["m10"] / M["m00"])
+                                cy = int(M["m01"] / M["m00"])
+                                best_score = score
+                                best_center = (x1 + cx, y1 + cy)
                             
+        # If a high-confidence pointer was found on this face, return it immediately
         if best_center:
             return best_center
             
+    # If the loop finishes and no high-scoring blobs were found, the pointer is not on a face.
     return None
 
 def process_single_video(video_task):
@@ -230,7 +244,6 @@ def process_single_video(video_task):
         if writer:
             writer.write(frame)
         
-        # Buffer skip via frame grabbing
         skip_frames = frame_interval - 1
         for _ in range(skip_frames):
             cap.grab()
@@ -362,37 +375,4 @@ def main():
             end_sec = time_to_sec(row['end_time'])
             if end_sec == 0: end_sec = float('inf')
 
-            if args.t and test_minutes is not None:
-                end_sec = min(end_sec, start_sec + (test_minutes * 60))
-
-            video_tasks.append({
-                'filepath': filepath,
-                'base_name': f"{pid}_POV",
-                'start_sec': start_sec,
-                'end_sec': end_sec,
-                'master_embeddings': master_embeddings,
-                'target_ids': target_ids,
-                'out_dir': group_out_dir,
-                'draw_video': args.d
-            })
-
-    if not video_tasks:
-        print("No valid tasks found to process.")
-        return
-
-    print(f"Queue built: {len(video_tasks)} videos ready.")
-    print(f"Starting {args.workers} workers...\n")
-
-    with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        futures = [executor.submit(process_single_video, task) for task in video_tasks]
-        
-        for future in as_completed(futures):
-            try:
-                future.result()
-            except Exception as exc:
-                print(f"Worker generated an exception: {exc}")
-
-    print("\nProcessing complete. Check notes.txt for warnings.")
-
-if __name__ == "__main__":
-    main()
+            if args.t and test_minutes is not
