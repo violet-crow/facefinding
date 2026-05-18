@@ -1,10 +1,8 @@
 import cv2
-import numpy as np
 import pandas as pd
 import argparse
 import os
 import warnings
-import onnxruntime as ort
 from insightface.app import FaceAnalysis
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -23,21 +21,16 @@ def format_time_ms(seconds):
     s = seconds % 60
     return f"{m:02d}:{s:06.3f}"
 
-def log_note(out_dir, message):
-    with open(os.path.join(out_dir, "notes.txt"), "a") as f:
-        f.write(message + "\n")
-
 def process_single_video(video_task):
     filepath = video_task['filepath']
     base_name = video_task['base_name']
     start_sec = video_task['start_sec']
     end_sec = video_task['end_sec']
-    master_embeddings = video_task['master_embeddings']
-    target_ids = video_task['target_ids']
     out_dir = video_task['out_dir']
     draw_video = video_task['draw_video']
 
-    app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider'])
+    # Restricted to 'detection' only to save VRAM and processing time
+    app = FaceAnalysis(name='buffalo_l', allowed_modules=['detection'], providers=['CUDAExecutionProvider'])
     app.prepare(ctx_id=0, det_size=(640, 640))
 
     cap = cv2.VideoCapture(filepath)
@@ -46,23 +39,22 @@ def process_single_video(video_task):
     width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
-    frame_interval = max(1, int(fps / 2))
+    # Corrected math to ensure exactly 2 frames a second
+    frame_interval = max(1, round(fps / 2)) 
     start_frame = int(start_sec * fps)
     end_frame = min(int(end_sec * fps), total_video_frames)
     
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     frame_idx = start_frame
     total_frames_to_process = max(1, end_frame - start_frame)
-    
     print_interval = max(1, int(total_frames_to_process / 10))
 
     writer = None
     if draw_video:
-        out_vid_path = os.path.join(out_dir, f"{base_name}_face_verification.mp4")
+        out_vid_path = os.path.join(out_dir, f"{base_name}_face_detection.mp4")
         writer = cv2.VideoWriter(out_vid_path, cv2.VideoWriter_fourcc(*'mp4v'), 2.0, (width, height))
 
     csv_data = []
-
     print(f"[{base_name}] Started processing.")
 
     while cap.isOpened() and frame_idx <= end_frame:
@@ -88,43 +80,19 @@ def process_single_video(video_task):
             'faces_detected_count': len(faces)
         }
 
-        all_columns = target_ids + ['UNKNOWN']
-        for label_id in all_columns:
-            row_data.update({
-                f'{label_id}_detected': False,
-                f'{label_id}_tl_x': '', f'{label_id}_tl_y': '',
-                f'{label_id}_br_x': '', f'{label_id}_br_y': ''
-            })
-
-        for face in faces:
-            identity = "UNKNOWN"
-            highest_sim = -1
-            best_pid = None
-            
-            for pid, master_emb in master_embeddings.items():
-                sim = np.dot(face.normed_embedding, master_emb)
-                if sim > highest_sim:
-                    highest_sim = sim
-                    best_pid = pid
-
-            if highest_sim > 0.38:
-                identity = best_pid
-
+        # Dynamically append coordinate columns for each detected face
+        for i, face in enumerate(faces):
             x1, y1, x2, y2 = map(int, face.bbox)
-
             row_data.update({
-                f'{identity}_detected': True,
-                f'{identity}_tl_x': x1,
-                f'{identity}_tl_y': y1,
-                f'{identity}_br_x': x2,
-                f'{identity}_br_y': y2
+                f'face_{i}_tl_x': x1,
+                f'face_{i}_tl_y': y1,
+                f'face_{i}_br_x': x2,
+                f'face_{i}_br_y': y2
             })
 
             if draw_video:
-                color = (0, 255, 0) if identity != "UNKNOWN" else (128, 128, 128)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                label_str = f"{identity} ({highest_sim:.2f})" if identity != "UNKNOWN" else "UNKNOWN"
-                cv2.putText(frame, label_str, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(frame, f"Face {i}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
         csv_data.append(row_data)
         if writer:
@@ -140,31 +108,34 @@ def process_single_video(video_task):
     cap.release()
     if writer: writer.release()
 
+    # Tracking output
     df_out = pd.DataFrame(csv_data)
-    df_out.to_csv(os.path.join(out_dir, f"{base_name}_face_tracking.csv"), index=False)
+    df_out.to_csv(os.path.join(out_dir, f"{base_name}_tracking.csv"), index=False)
 
+    # Summary output
     total_queried = len(df_out)
     if total_queried > 0:
-        avg_faces = df_out['faces_detected_count'].mean()
+        total_faces = int(df_out['faces_detected_count'].sum())
+        mean_faces = df_out['faces_detected_count'].mean()
         
         summary_data = {
-            'total_frames_queried': total_queried,
-            'avg_faces_per_frame': round(avg_faces, 2)
+            'total_frames_processed': total_queried,
+            'total_faces_detected': total_faces,
+            'mean_faces_per_frame': round(mean_faces, 2)
         }
-        pd.DataFrame([summary_data]).to_csv(os.path.join(out_dir, f"{base_name}_face_summary.csv"), index=False)
+        pd.DataFrame([summary_data]).to_csv(os.path.join(out_dir, f"{base_name}_summary.csv"), index=False)
 
     print(f"[{base_name}] Completed and saved.")
     return base_name
 
 def get_args():
-    parser = argparse.ArgumentParser(description="Multiprocessing Face Tracker (No Gaze)")
-    parser.add_argument('manifest', nargs='?', type=str, default=r'C:\Users\VHILAB Core\Desktop\Spatial Coherence\facefinding\tracker_manifest.csv', help="Path to manifest.csv")
+    parser = argparse.ArgumentParser(description="Multiprocessing Face Detection Pipeline")
+    parser.add_argument('manifest', nargs='?', type=str, default=r'tracker_manifest.csv', help="Path to manifest.csv")
     parser.add_argument('-t', action='store_true', help="Test mode")
-    parser.add_argument('-d', action='store_true', help="Output drawn verification video")
-    parser.add_argument('--dir', type=str, default=r'C:\Users\VHILAB Core\Desktop\Spatial Coherence\POV Videos')
+    parser.add_argument('-d', action='store_true', help="Output drawn bounding box video")
+    parser.add_argument('--dir', type=str, required=True, help="Directory containing source videos")
     parser.add_argument('--out', type=str, default='./output')
-    parser.add_argument('--known', type=str, default='./known_faces')
-    parser.add_argument('--workers', type=int, default=6, help="Workers")
+    parser.add_argument('--workers', type=int, default=6, help="Worker pool count")
     return parser.parse_args()
 
 def main():
@@ -202,25 +173,6 @@ def main():
         group_out_dir = os.path.join(args.out, f"Group_{group_num}")
         os.makedirs(group_out_dir, exist_ok=True)
         
-        target_ids = group_data['participant_num'].tolist()
-        
-        master_embeddings = {}
-        for pid in target_ids:
-            ref_dir = os.path.join(args.known, pid)
-            if not os.path.exists(ref_dir):
-                log_note(args.out, f"Group {group_num}: Missing profile for {pid}.")
-                continue
-                
-            person_embeddings = []
-            for file_name in os.listdir(ref_dir):
-                if file_name.lower().endswith(('.png', '.jpg')):
-                    npy_path = os.path.join(ref_dir, f"{os.path.splitext(file_name)[0]}.npy")
-                    if os.path.exists(npy_path):
-                        person_embeddings.append(np.load(npy_path))
-            
-            if person_embeddings:
-                master_embeddings[pid] = np.mean(person_embeddings, axis=0)
-
         for _, row in group_data.iterrows():
             pid = row['participant_num']
             filename = f"{pid}_POV.mp4"
@@ -241,8 +193,6 @@ def main():
                 'base_name': f"{pid}_POV",
                 'start_sec': start_sec,
                 'end_sec': end_sec,
-                'master_embeddings': master_embeddings,
-                'target_ids': target_ids,
                 'out_dir': group_out_dir,
                 'draw_video': args.d
             })
