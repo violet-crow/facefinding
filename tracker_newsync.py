@@ -29,23 +29,19 @@ def process_single_video(video_task):
     out_dir = video_task['out_dir']
     draw_video = video_task['draw_video']
 
+    # Restricted to 'detection' only to save VRAM and processing time
     app = FaceAnalysis(name='buffalo_l', allowed_modules=['detection'], providers=['CUDAExecutionProvider'])
     app.prepare(ctx_id=0, det_size=(640, 640))
 
     cap = cv2.VideoCapture(filepath)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
-    frame_interval = max(1, round(fps / 2)) 
-    start_frame = int(start_sec * fps)
-    end_frame = min(int(end_sec * fps), total_video_frames)
-    
-    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-    frame_idx = start_frame
-    total_frames_to_process = max(1, end_frame - start_frame)
-    print_interval = max(1, int(total_frames_to_process / 10))
+    start_msec = start_sec * 1000.0
+    end_msec = end_sec * 1000.0
+    target_msec = start_msec
+
+    cap.set(cv2.CAP_PROP_POS_MSEC, start_msec)
 
     writer = None
     if draw_video:
@@ -53,79 +49,67 @@ def process_single_video(video_task):
         writer = cv2.VideoWriter(out_vid_path, cv2.VideoWriter_fourcc(*'mp4v'), 2.0, (width, height))
 
     csv_data = []
+    frames_processed_count = 0
     print(f"[{base_name}] Started processing.")
 
-    # --- BRUTE FORCE VARIABLES ---
-    consecutive_failures = 0
-    max_failures = 1000  # Gives up after ~30 seconds of pure dead frames
-
-    while cap.isOpened() and frame_idx <= end_frame:
-        ret, frame = cap.read()
+    while cap.isOpened():
+        current_msec = cap.get(cv2.CAP_PROP_POS_MSEC)
         
-        # --- BRUTE FORCE LOGIC ---
-        if not ret: 
-            consecutive_failures += 1
-            if consecutive_failures > max_failures:
-                print(f"[{base_name}] Reached true EOF or unrecoverable corruption at frame {frame_idx}.")
+        if current_msec > end_msec:
+            break
+
+        if current_msec >= target_msec:
+            ret, frame = cap.read()
+            if not ret: 
                 break
+                
+            frames_processed_count += 1
+            current_time_str = format_time_ms(current_msec / 1000.0)
             
-            # Manually force the playhead forward past the bad frame
-            frame_idx += 1
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            continue
+            if frames_processed_count % 50 == 0:
+                print(f"[{base_name}] Processed frame at {current_time_str}")
+
+            faces = app.get(frame)
             
-        consecutive_failures = 0 # Reset strikes on a successful read
-        # -------------------------
+            row_data = {
+                'frame': int(cap.get(cv2.CAP_PROP_POS_FRAMES)),
+                'time': current_time_str,
+                'faces_detected_count': len(faces)
+            }
 
-        if (frame_idx - start_frame) % frame_interval != 0:
-            frame_idx += 1
-            continue
+            # Dynamically append coordinate columns for each detected face
+            for i, face in enumerate(faces):
+                x1, y1, x2, y2 = map(int, face.bbox)
+                row_data.update({
+                    f'face_{i}_tl_x': x1,
+                    f'face_{i}_tl_y': y1,
+                    f'face_{i}_br_x': x2,
+                    f'face_{i}_br_y': y2
+                })
 
-        frames_processed = frame_idx - start_frame
-        if frames_processed % print_interval == 0 or frame_idx == end_frame:
-            percent = (frames_processed / total_frames_to_process) * 100
-            print(f"[{base_name}] Frame {frame_idx}/{end_frame} ({percent:.1f}%)")
+                if draw_video:
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.putText(frame, f"Face {i}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-        current_time_ms = format_time_ms(frame_idx / fps)
-        
-        faces = app.get(frame)
-        
-        row_data = {
-            'frame': frame_idx,
-            'time': current_time_ms,
-            'faces_detected_count': len(faces)
-        }
-
-        for i, face in enumerate(faces):
-            x1, y1, x2, y2 = map(int, face.bbox)
-            row_data.update({
-                f'face_{i}_tl_x': x1,
-                f'face_{i}_tl_y': y1,
-                f'face_{i}_br_x': x2,
-                f'face_{i}_br_y': y2
-            })
-
-            if draw_video:
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(frame, f"Face {i}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-        csv_data.append(row_data)
-        if writer:
-            writer.write(frame)
-        
-        skip_frames = frame_interval - 1
-        for _ in range(skip_frames):
-            cap.grab()
-            frame_idx += 1
+            csv_data.append(row_data)
+            if writer:
+                writer.write(frame)
             
-        frame_idx += 1
+            target_msec += 500.0
+            
+        else:
+            ret = cap.grab()
+            if not ret: 
+                break
 
     cap.release()
     if writer: writer.release()
 
+    # Tracking output
     df_out = pd.DataFrame(csv_data)
     df_out.to_csv(os.path.join(out_dir, f"{base_name}_tracking.csv"), index=False)
 
+    # Summary output
     total_queried = len(df_out)
     if total_queried > 0:
         total_faces = int(df_out['faces_detected_count'].sum())
@@ -142,7 +126,7 @@ def process_single_video(video_task):
     return base_name
 
 def get_args():
-    parser = argparse.ArgumentParser(description="Multiprocessing Face Detection Pipeline (Brute Force Mode)")
+    parser = argparse.ArgumentParser(description="Multiprocessing Face Detection Pipeline")
     parser.add_argument('manifest', nargs='?', type=str, default=r'tracker_manifest.csv', help="Path to manifest.csv")
     parser.add_argument('-t', action='store_true', help="Test mode")
     parser.add_argument('-d', action='store_true', help="Output drawn bounding box video")
