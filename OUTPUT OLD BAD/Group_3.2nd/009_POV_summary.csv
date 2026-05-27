@@ -1,2 +1,0 @@
-total_frames_queried,avg_faces_per_frame,pct_gaze_on_any_face,mean_gaze_delta_x,mean_gaze_delta_y,mean_gaze_euclidean,pct_gaze_on_008,pct_gaze_on_009,pct_gaze_on_010,pct_gaze_on_011,pct_gaze_on_UNKNOWN
-361,1.36,0.28,76.67,37.64,88.26,0.28,0.0,0.0,0.0,0.0
