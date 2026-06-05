@@ -5,11 +5,11 @@ import subprocess
 import argparse
 from pathlib import Path
 
-INPUT_DIR = r"P:\VHIL\Videos\facefinding\output"
+INPUT_DIR = r"P:\VHIL\Videos\facefinding\Face Detection\output"
 VIDEO_DIR = r"P:\VHIL\Videos\POV"
-OUTPUT_DIR = r"P:\VHIL\Videos\facefinding\nosmallcsvs"
-SPOT_CHECK_DIR = r"P:\VHIL\Videos\facefinding\smallspotcheck"
-LOG_FILE = "all_small_faces.csv"
+OUTPUT_DIR = r"P:\VHIL\Videos\facefinding\Self View Removal\Small Faces Removed"
+SPOT_CHECK_DIR = r"P:\VHIL\Videos\facefinding\Self View Removal\Detected Small Faces"
+LOG_FILE = "detected_small_faces.csv"
 
 def parse_time_to_seconds(time_str):
     parts = str(time_str).split(':')
@@ -82,7 +82,7 @@ def process_tracking_data():
                                 if face_area < 8500:
                                     other_areas = [f[1] for f in valid_faces if f[0] != face_id]
                                     avg_other_area = sum(other_areas) / len(other_areas)
-                                    if face_area <= (0.20 * avg_other_area):
+                                    if face_area <= (0.34 * avg_other_area):
                                         small_face_candidates.append(face)
                             
                             if len(small_face_candidates) == 1:

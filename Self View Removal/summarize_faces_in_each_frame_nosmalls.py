@@ -2,37 +2,30 @@ import pandas as pd
 from pathlib import Path
 
 # --- CONFIGURATION ---
-# Replace with the path to your main directory containing the subdirectories
-TARGET_DIR = r'P:\VHIL\Videos\facefinding\process_nosmalls' 
-# The path where the summary CSV will be saved (this will overwrite any existing file)
+TARGET_DIR = r'P:\VHIL\Videos\facefinding\Self View Removal\Small Faces Removed' 
 SUMMARY_CSV = 'summarize_faces_in_each_frame_nosmalls.csv' 
 # ---------------------
 
 def create_summary():
     results = []
     
-    # 1) & 2) Recursively explore all subdirectories and find files ending in _tracking.csv
-    # The rglob method handles the deep searching automatically.
     for filepath in Path(TARGET_DIR).rglob('*_tracking.csv'):
         filename = filepath.name
-        
-        # Extract the participant number (everything before the first underscore)
         participant_num = filename.split('_')[0]
         
         try:
             df = pd.read_csv(filepath)
             
-            # 4b) Total frames queried (equal to the number of non-header rows)
+            # Clean column names in case of trailing whitespaces
+            df.columns = df.columns.str.strip()
+            
             total_frames = len(df)
             
-            # 4a) Identify the 3rd column (index 2, since it is 0-indexed)
-            faces_col = df.columns[2]
+            # Directly target the named column
+            faces_col = 'faces_detected_count'
             
-            # Fill missing values with a dummy number, convert to integer, then to string. 
-            # This ensures pandas doesn't accidentally count '1.0' and '1' as two separate things.
             counts = df[faces_col].fillna(-1).astype(int).astype(str).value_counts()
             
-            # Extract counts for 0, 1, 2, 3, 4 (defaulting to 0 if the number didn't appear in the file)
             results.append({
                 'participant_num': participant_num,
                 'count_0': counts.get('0', 0),
@@ -46,14 +39,18 @@ def create_summary():
         except Exception as e:
             print(f"Error processing {filename}: {e}")
 
-    # 3) Create the summary CSV (overwrites by default)
     if results:
         summary_df = pd.DataFrame(results)
         
-        # Sort by participant number before saving so the file is organized sequentially
+        # Convert to numeric to ensure correct sequential sorting (1, 2, 10 instead of 1, 10, 2)
+        try:
+            summary_df['participant_num'] = pd.to_numeric(summary_df['participant_num'])
+        except ValueError:
+            pass
+            
         summary_df = summary_df.sort_values('participant_num')
-        summary_df.to_csv(SUMMARY_CSV, index=False)
         
+        summary_df.to_csv(SUMMARY_CSV, index=False)
         print(f"Successfully processed {len(results)} files. Summary saved to {SUMMARY_CSV}")
     else:
         print(f"No *_tracking.csv files were found in {TARGET_DIR}.")

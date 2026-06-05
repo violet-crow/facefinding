@@ -2,7 +2,7 @@ import os
 import re
 import pandas as pd
 
-base_dir = r"P:\VHIL\Videos\facefinding\Self View Removal\process_nosmalls"
+base_dir = r"P:\VHIL\Videos\facefinding\Self View Removal\Small Faces Removed"
 manifest_path = "plot_manifest.csv"
 
 def time_to_seconds(t_str):
@@ -25,6 +25,17 @@ def time_to_seconds(t_str):
 manifest = pd.read_csv(manifest_path)
 
 for group, group_df in manifest.groupby('group'):
+    
+    # Pre-scan for group-level metadata
+    task_start_sec = None
+    condition_str = ""
+    
+    for _, row in group_df.iterrows():
+        if 'condition' in row and pd.notna(row['condition']):
+            condition_str = str(row['condition'])
+        if 'task_time' in row and pd.notna(row['task_time']):
+            task_start_sec = time_to_seconds(row['task_time']) - time_to_seconds(row['sync_time'])
+
     series_list = []
     
     for _, row in group_df.iterrows():
@@ -62,6 +73,27 @@ for group, group_df in manifest.groupby('group'):
     if series_list:
         merged_df = pd.concat(series_list, axis=1)
         merged_df.sort_index(inplace=True)
+        
+        # Calculate Numeric Average
+        raw_mean_num = merged_df.mean(axis=1)
+        raw_mean_num.index = pd.to_timedelta(raw_mean_num.index, unit='s')
+        smoothed_num = raw_mean_num.rolling('5s', min_periods=1).mean()
+        merged_df['average_numeric'] = smoothed_num.values.round(2)
+        
+        # Calculate Binary Average
+        binary_df = merged_df.copy()
+        binary_df[binary_df > 0] = 1
+        raw_mean_bin = binary_df.mean(axis=1)
+        raw_mean_bin.index = pd.to_timedelta(raw_mean_bin.index, unit='s')
+        smoothed_bin = raw_mean_bin.rolling('5s', min_periods=1).mean()
+        merged_df['average_binary'] = smoothed_bin.values.round(2)
+        
+        # Append group metadata
+        if task_start_sec is not None:
+            merged_df['task_start_sec'] = task_start_sec
+            merged_df['task_end_sec'] = task_start_sec + (13 * 60) # + 13 minutes
+        if condition_str:
+            merged_df['condition'] = condition_str
         
         merged_df.insert(0, 'time', merged_df.index)
         
